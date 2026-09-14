@@ -1,0 +1,308 @@
+{
+  "name": "Price Drop Monitor: Fetch, Compare, Persist, Alert",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "b2c3d4e5-0001-4b20-9f02-000000000001",
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-680, 320],
+      "notes": "Runs the price check on a schedule (every 6h by default). This is the only trigger, no credentials needed to start the run."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.PRICE_SOURCE_URL || 'https://dummyjson.com/products?limit=30' }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "b2c3d4e5-0002-4b20-9f02-000000000002",
+      "name": "Fetch Prices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-460, 320],
+      "notes": "Fetches the current price list from any JSON source. Default demo = dummyjson.com/products (no auth). Override with an n8n variable PRICE_SOURCE_URL, or hardcode your own endpoint and add credentials in the node."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize any price payload into a flat list of {id, name, price, url, currency}.\n// Edit the mapping below to match YOUR source's field names.\nconst input = $input.first().json;\n\nconst raw = input.products || input.items || input.data || (Array.isArray(input) ? input : []);\n\nconst out = raw.map((r) => {\n  const id = String(r.id ?? r.sku ?? r.productId ?? r.url ?? '');\n  return {\n    json: {\n      id,\n      name: r.title ?? r.name ?? r.productName ?? '(no name)',\n      price: Number(r.price ?? r.currentPrice ?? r.amount ?? 0),\n      currency: r.currency ?? 'USD',\n      url: r.url ?? r.link ?? r.permalink ?? '',\n      checkedAt: new Date().toISOString()\n    }\n  };\n}).filter((x) => x.json.id && x.json.price > 0);\n\nreturn out;"
+      },
+      "id": "b2c3d4e5-0003-4b20-9f02-000000000003",
+      "name": "Normalize Products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 320],
+      "notes": "Flattens the source payload into one clean product per row. This is the ONE place you adapt the template to a new source: change the field mapping and you are done."
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Prices",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "b2c3d4e5-0004-4b20-9f02-000000000004",
+      "name": "Read Previous Prices",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [-20, 320],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Reads the last-known prices from the sheet so we can compare against them. 'Always Output Data' is on so the very first run (empty sheet) still passes through. Header row must contain: id, name, price, currency, url, lowestPrice, checkedAt."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compare current prices against the previous run stored in the sheet.\n// Builds a lookup of previous prices, then flags drops on the current items.\nconst DROP_PCT = Number($vars.DROP_THRESHOLD_PCT || 10); // alert if price fell >= this %\n\n// Previous rows come from the 'Read Previous Prices' node (may be empty on run 1).\nlet prevRows = [];\ntry {\n  prevRows = $('Read Previous Prices').all().map((i) => i.json).filter((r) => r && r.id != null);\n} catch (e) {\n  prevRows = [];\n}\nconst prev = {};\nfor (const r of prevRows) {\n  prev[String(r.id)] = {\n    price: Number(r.price ?? 0),\n    lowestPrice: Number(r.lowestPrice ?? r.price ?? 0)\n  };\n}\n\n// Current products come from 'Normalize Products'.\nconst current = $('Normalize Products').all().map((i) => i.json);\n\nconst out = current.map((c) => {\n  const p = prev[String(c.id)];\n  const oldPrice = p ? p.price : null;\n  const prevLowest = p ? p.lowestPrice : c.price;\n  const lowestPrice = Math.min(prevLowest || c.price, c.price);\n\n  let changePct = 0;\n  if (oldPrice && oldPrice > 0) {\n    changePct = Math.round(((c.price - oldPrice) / oldPrice) * 1000) / 10; // 1 decimal\n  }\n  const isDrop = oldPrice != null && changePct <= -DROP_PCT;\n\n  return {\n    json: {\n      ...c,\n      oldPrice,\n      changePct,\n      lowestPrice,\n      isAllTimeLow: c.price <= lowestPrice,\n      isDrop\n    }\n  };\n});\n\nreturn out;"
+      },
+      "id": "b2c3d4e5-0005-4b20-9f02-000000000005",
+      "name": "Detect Drops",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [200, 320],
+      "notes": "The core logic: joins current prices with the previous run, computes the percentage change, tracks the all-time-low, and flags an item as a drop when it fell at least DROP_THRESHOLD_PCT (default 10%). First run has no history, so nothing is flagged (baseline)."
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Prices",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.id }}",
+            "name": "={{ $json.name }}",
+            "price": "={{ $json.price }}",
+            "currency": "={{ $json.currency }}",
+            "url": "={{ $json.url }}",
+            "lowestPrice": "={{ $json.lowestPrice }}",
+            "checkedAt": "={{ $json.checkedAt }}"
+          },
+          "matchingColumns": ["id"],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "id": "b2c3d4e5-0006-4b20-9f02-000000000006",
+      "name": "Persist Prices",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [420, 320],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Upserts the current price of EVERY product back into the sheet (append or update on 'id'). This becomes the baseline for the next run, so the comparison is stateful without any database."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "drop-only",
+              "leftValue": "={{ $json.isDrop }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2c3d4e5-0007-4b20-9f02-000000000007",
+      "name": "Only Drops",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [640, 320],
+      "notes": "Gate so alerts fire only for real price drops. Every product is still saved above; only the ones that fell past the threshold continue to the notifications."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/REPLACE/ME' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  content: ':chart_with_downwards_trend: **Price drop** ' + $json.name + '\\n' + $json.oldPrice + ' -> ' + $json.price + ' ' + $json.currency + ' (' + $json.changePct + '%)' + ($json.isAllTimeLow ? '  :fire: all-time low' : '') + '\\n' + $json.url\n}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "b2c3d4e5-0008-4b20-9f02-000000000008",
+      "name": "Notify Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 220],
+      "notes": "Posts each price drop to a Discord (or Slack) incoming webhook. For Slack use its webhook URL and change the body to { text: ... }. Set DISCORD_WEBHOOK_URL as an n8n variable or paste the URL here."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $vars.ALERT_FROM_EMAIL || 'alerts@example.com' }}",
+        "toEmail": "={{ $vars.ALERT_TO_EMAIL || 'you@example.com' }}",
+        "subject": "={{ 'Price drop: ' + $json.name + ' (' + $json.changePct + '%)' }}",
+        "emailFormat": "text",
+        "text": "={{ $json.name + '\\n\\nOld price: ' + $json.oldPrice + ' ' + $json.currency + '\\nNew price: ' + $json.price + ' ' + $json.currency + '\\nChange: ' + $json.changePct + '%\\nAll-time low: ' + ($json.isAllTimeLow ? 'yes' : 'no') + '\\n\\n' + $json.url }}",
+        "options": {}
+      },
+      "id": "b2c3d4e5-0009-4b20-9f02-000000000009",
+      "name": "Email Alert (SMTP)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [860, 420],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "SMTP account"
+        }
+      },
+      "notes": "Optional second channel: emails the drop via SMTP (set host/port/user/pass in an SMTP credential). Set ALERT_FROM_EMAIL / ALERT_TO_EMAIL as n8n variables. Delete this node if Discord is enough."
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Fetch Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Prices": {
+      "main": [
+        [
+          {
+            "node": "Normalize Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Products": {
+      "main": [
+        [
+          {
+            "node": "Read Previous Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Previous Prices": {
+      "main": [
+        [
+          {
+            "node": "Detect Drops",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Drops": {
+      "main": [
+        [
+          {
+            "node": "Persist Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Prices": {
+      "main": [
+        [
+          {
+            "node": "Only Drops",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only Drops": {
+      "main": [
+        [
+          {
+            "node": "Notify Discord",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Alert (SMTP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "price-monitoring"
+    },
+    {
+      "name": "alerts"
+    }
+  ]
+}
