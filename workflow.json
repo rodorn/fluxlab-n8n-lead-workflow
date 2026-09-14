@@ -1,0 +1,335 @@
+{
+  "name": "Lead & Deal Watcher: Fetch, Score, Sheet, Notify",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "a1b2c3d4-0001-4a10-8f01-000000000001",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-560, 320],
+      "notes": "Runs the pipeline once per hour. Change to minutes/days here. This is the only trigger: no manual credentials needed to start."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.SOURCE_URL || 'https://hn.algolia.com/api/v1/search_by_date?tags=story&query=automation&hitsPerPage=30' }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "a1b2c3d4-0002-4a10-8f01-000000000002",
+      "name": "Fetch Source",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-340, 320],
+      "notes": "Fetches raw items from any JSON HTTP/API/RSS-to-JSON source. Default demo source = Hacker News Algolia API (no auth). Override with an n8n variable SOURCE_URL, or hardcode your own endpoint / add credentials in the node."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize any source payload into a flat list of items.\n// Edit the mapping below to match YOUR source's field names.\nconst input = $input.first().json;\n\n// Try common shapes: {hits:[...]}, {items:[...]}, [...], {data:[...]}\nconst raw = input.hits || input.items || input.data || (Array.isArray(input) ? input : []);\n\nconst out = raw.map((r) => {\n  const id = String(r.objectID ?? r.id ?? r.guid ?? r.url ?? '');\n  return {\n    json: {\n      id,\n      title: r.title ?? r.story_title ?? r.name ?? '(no title)',\n      url: r.url ?? r.story_url ?? r.link ?? '',\n      author: r.author ?? r.by ?? '',\n      points: Number(r.points ?? r.score ?? 0),\n      comments: Number(r.num_comments ?? r.comments ?? 0),\n      createdAt: r.created_at ?? r.date ?? new Date().toISOString(),\n      fetchedAt: new Date().toISOString()\n    }\n  };\n}).filter((x) => x.json.id && x.json.title);\n\nreturn out;"
+      },
+      "id": "a1b2c3d4-0003-4a10-8f01-000000000003",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-120, 320],
+      "notes": "Flattens the source payload into one clean item per row. This is the ONE place you adapt the template to a new source: change the field mapping and you are done."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-1",
+              "leftValue": "={{ $json.points }}",
+              "rightValue": 5,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "cond-2",
+              "leftValue": "={{ $json.url }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0004-4a10-8f01-000000000004",
+      "name": "Filter Relevant",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [100, 320],
+      "notes": "Keeps only items worth acting on (has URL, meets a minimum score). Tune the thresholds to control volume and cost of the AI step below."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'gpt-4o-mini',\n  temperature: 0,\n  response_format: { type: 'json_object' },\n  messages: [\n    { role: 'system', content: 'You are a lead-scoring assistant. Reply ONLY with JSON: {\"score\": <0-100 int>, \"reason\": \"<short>\"}. Score how relevant this item is to a B2B automation/AI-services buyer.' },\n    { role: 'user', content: 'TITLE: ' + $json.title + '\\nURL: ' + $json.url }\n  ]\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a1b2c3d4-0005-4a10-8f01-000000000005",
+      "name": "AI Score (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [320, 320],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "OpenAI Bearer (Header Auth)"
+        }
+      },
+      "notes": "Enriches each item with an AI relevance score via a generic HTTP call (works with any OpenAI-compatible endpoint). Set a Header Auth credential with 'Authorization: Bearer <API_KEY>'. Swap the URL/model for Anthropic, OpenRouter, Groq, or a local LLM. Can be deleted if you only need a rule-based score."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the AI response back onto the item and derive a routing tag.\nconst item = $json;\n\nlet score = 0, reason = '';\ntry {\n  const content = item.choices?.[0]?.message?.content ?? '{}';\n  const parsed = typeof content === 'string' ? JSON.parse(content) : content;\n  score = Number(parsed.score ?? 0);\n  reason = String(parsed.reason ?? '');\n} catch (e) {\n  reason = 'parse_error: ' + e.message;\n}\n\n// Pull the original fields forward from the AI-Score input item.\nconst src = $('Filter Relevant').item.json;\n\nconst tier = score >= 70 ? 'HOT' : score >= 40 ? 'WARM' : 'COLD';\n\nreturn [{\n  json: {\n    ...src,\n    aiScore: score,\n    aiReason: reason,\n    tier\n  }\n}];"
+      },
+      "id": "a1b2c3d4-0006-4a10-8f01-000000000006",
+      "name": "Merge Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [540, 320],
+      "notes": "Parses the AI JSON, attaches score + reason to the original item, and computes a HOT/WARM/COLD tier used both for the Sheet row and the notification."
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.id }}",
+            "title": "={{ $json.title }}",
+            "url": "={{ $json.url }}",
+            "aiScore": "={{ $json.aiScore }}",
+            "tier": "={{ $json.tier }}",
+            "aiReason": "={{ $json.aiReason }}",
+            "fetchedAt": "={{ $json.fetchedAt }}"
+          },
+          "matchingColumns": ["id"],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0007-4a10-8f01-000000000007",
+      "name": "Save to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [760, 320],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Upserts each scored item into a sheet (append or update on matching 'id', so re-runs do not duplicate rows). Header row must contain: id, title, url, aiScore, tier, aiReason, fetchedAt."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "hot-only",
+              "leftValue": "={{ $json.tier }}",
+              "rightValue": "HOT",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0008-4a10-8f01-000000000008",
+      "name": "Only HOT",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [980, 320],
+      "notes": "Gate so you are only pinged for high-value items. Remove this node to be notified about everything, or change the tier."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/REPLACE/ME' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  content: '**' + $json.tier + ' (' + $json.aiScore + ')** ' + $json.title + '\\n' + $json.url + '\\n_' + $json.aiReason + '_'\n}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a1b2c3d4-0009-4a10-8f01-000000000009",
+      "name": "Notify Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 320],
+      "notes": "Posts HOT items to a Discord (or Slack) incoming webhook. For Slack use its webhook URL and change the body to { text: ... }. Set DISCORD_WEBHOOK_URL as an n8n variable or paste the URL here."
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Fetch Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Source": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Filter Relevant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Relevant": {
+      "main": [
+        [
+          {
+            "node": "AI Score (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Score (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Merge Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Score": {
+      "main": [
+        [
+          {
+            "node": "Save to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Only HOT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only HOT": {
+      "main": [
+        [
+          {
+            "node": "Notify Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "lead-gen"
+    },
+    {
+      "name": "ai"
+    }
+  ]
+}
