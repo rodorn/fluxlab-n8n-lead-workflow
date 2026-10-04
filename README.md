@@ -1,5 +1,7 @@
 # n8n Templates, FluxLab
 
+> n8n workflows built and hosted for your company: [fluxlab.pl/n8n](https://fluxlab.pl/n8n?utm_source=github&utm_campaign=fluxlab-n8n-lead-workflow)
+
 Two ready-to-import, production-shaped n8n workflows. Core nodes only, no community
 packages, inline notes on every step. Each is validated in CI.
 
